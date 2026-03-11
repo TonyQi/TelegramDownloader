@@ -1,0 +1,6 @@
+{
+  "download_dir": "D:\\Workspace\\Telegram Downloader\\Telegram Downloader\\downloads",
+  "max_concurrent_tasks": 1,
+  "chunk_concurrency": 8,
+  "refresh_interval_ms": 700
+}

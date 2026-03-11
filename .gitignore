@@ -1,0 +1,4 @@
+downloads/*
+sessions/*
+.idea/*
+__pycache__/*
