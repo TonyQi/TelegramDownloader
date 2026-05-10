@@ -1,4 +1,9 @@
 downloads/*
 sessions/*
 .idea/*
+build/*
+dist/*
+*.spec.bak
+*.pyc
 __pycache__/*
+**/__pycache__/*

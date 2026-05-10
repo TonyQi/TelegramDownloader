@@ -28,5 +28,13 @@ DEFAULT_SETTINGS = {
     "download_dir": str(DOWNLOAD_DIR),
     "max_concurrent_tasks": 3,
     "chunk_concurrency": 4,
-    "refresh_interval_ms": 700
+    "refresh_interval_ms": 700,
+    "proxy": {
+        "enabled": True,
+        "scheme": GLOBAL_PROXY["scheme"],
+        "host": GLOBAL_PROXY["host"],
+        "port": GLOBAL_PROXY["port"],
+        "username": GLOBAL_PROXY["username"],
+        "password": GLOBAL_PROXY["password"],
+    },
 }

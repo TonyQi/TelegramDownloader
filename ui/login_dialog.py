@@ -12,7 +12,7 @@ class LoginDialog(QDialog):
         self.setWindowTitle("Telegram 二维码登录")
         self.resize(380, 460)
 
-        self.status_label = QLabel("正在生成二维码…")
+        self.status_label = QLabel("正在生成二维码...")
         self.status_label.setAlignment(Qt.AlignCenter)
 
         self.qr_label = QLabel()
@@ -41,10 +41,12 @@ class LoginDialog(QDialog):
             raw = base64.b64decode(data["image_base64"])
             pixmap = QPixmap()
             pixmap.loadFromData(raw, "PNG")
-            self.qr_label.setPixmap(pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.qr_label.setPixmap(
+                pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
             self.status_label.setText("请用 Telegram 手机客户端扫码登录")
         except Exception as exc:
-            self.status_label.setText(f"二维码生成失败：{exc}")
+            self.status_label.setText(f"二维码生成失败: {exc}")
 
     def check_login(self):
         try:

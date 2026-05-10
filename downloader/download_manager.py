@@ -59,6 +59,9 @@ class DownloadManager:
         self._schedule_next()
         return task
 
+    def add_message_task(self, chat_ref: str, message_id: int) -> DownloadTask:
+        return self.add_task(f"tg://message/{chat_ref}/{int(message_id)}")
+
     def list_tasks(self):
         with self.lock:
             return list(self.tasks.values())
@@ -179,7 +182,7 @@ class DownloadManager:
 
     async def _run_task(self, task: DownloadTask):
         try:
-            chat, message_id = parse_message_link(task.url)
+            chat, message_id = self._parse_task_target(task.url)
         except Exception as exc:
             task.set_status("failed")
             task.set_error(str(exc))
@@ -191,6 +194,9 @@ class DownloadManager:
                 task.set_status("cancelled")
                 db.upsert_task(task)
                 return
+
+            if isinstance(chat, str) and task.url.startswith("tg://message/"):
+                chat = await self.telegram_service.resolve_entity(chat)
 
             msg = await self.telegram_service.client.get_messages(chat, ids=message_id)
             if not msg or not getattr(msg, "document", None):
@@ -310,12 +316,24 @@ class DownloadManager:
             else:
                 task.set_status("paused")
 
-            db.upsert_task(task)
+                db.upsert_task(task)
 
         except Exception as exc:
             task.set_status("failed")
             task.set_error(str(exc))
             db.upsert_task(task)
+
+    @staticmethod
+    def _parse_task_target(url: str):
+        prefix = "tg://message/"
+        if url.startswith(prefix):
+            rest = url[len(prefix):]
+            chat_ref, sep, message_id = rest.rpartition("/")
+            if not sep or not chat_ref or not message_id:
+                raise ValueError("Invalid internal Telegram message reference")
+            return chat_ref, int(message_id)
+
+        return parse_message_link(url)
 
     def _load_tasks_from_db(self):
         saved_tasks = db.list_tasks()

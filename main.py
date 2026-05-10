@@ -1,7 +1,7 @@
 import sys
 
 from PySide6.QtWidgets import QApplication
-##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
+
 from config import APP_NAME
 from core.settings_manager import settings_manager
 from downloader.download_manager import DownloadManager
@@ -14,7 +14,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
 
-    telegram_service = TelegramService()
+    telegram_service = TelegramService(settings_manager)
     telegram_service.start()
 
     download_manager = DownloadManager(telegram_service, settings_manager)
