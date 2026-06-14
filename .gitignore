@@ -1,5 +1,6 @@
 downloads/*
 sessions/*
+data/cache/*
 .idea/*
 build/*
 dist/*

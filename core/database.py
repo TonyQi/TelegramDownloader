@@ -101,6 +101,16 @@ class Database:
             task.file_path = row["file_path"] or ""
             task.created_at = row["created_at"]
             task.updated_at = row["updated_at"]
+            if (
+                task.total_size > 0
+                and task.file_path
+                and Path(task.file_path).exists()
+                and Path(task.file_path).stat().st_size >= task.total_size
+            ):
+                task.downloaded_size = task.total_size
+                task.progress = 100.0
+                task.speed = 0.0
+                task.status = "finished"
             tasks.append(task)
 
         return tasks

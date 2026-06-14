@@ -12,6 +12,7 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.help import GetConfigRequest
 
 from config import API_HASH, API_ID, SESSION_FILE, SESSIONS_DIR
+from core.cache_store import cache_store
 from core.proxy import build_telethon_proxy
 
 
@@ -30,6 +31,10 @@ class TelegramService:
         self._dialog_entities = {}
         self._message_handlers = []
         self._new_message_handler = None
+
+        # 原始 Telethon 消息对象缓存，用于缩略图直接下载，
+        # 避免 _message_thumbnail_base64() 重新调用 get_messages()
+        self._raw_message_cache = {}  # {(chat_ref, message_id): Telethon Message}
 
         self._loop_ready = Event()
         self._connect_ready = Event()
@@ -107,6 +112,42 @@ class TelegramService:
     def call(self, coro, timeout=None):
         return self.submit(coro).result(timeout=timeout)
 
+    @staticmethod
+    def _is_transient_network_error(exc):
+        text = str(exc).lower()
+        transient_markers = (
+            "server closed the connection",
+            "connection closed",
+            "connection reset",
+            "connection aborted",
+            "incomplete",
+            "read on a total",
+            "timed out",
+            "timeout",
+        )
+        return isinstance(
+            exc,
+            (
+                ConnectionError,
+                OSError,
+                asyncio.TimeoutError,
+                asyncio.IncompleteReadError,
+            ),
+        ) or any(marker in text for marker in transient_markers)
+
+    async def _reconnect_after_transient_error(self):
+        if self.client is None:
+            return
+        try:
+            await self.client.disconnect()
+        except Exception:
+            pass
+        await asyncio.sleep(0.8)
+        try:
+            await self.client.connect()
+        except Exception:
+            pass
+
     def _install_event_handlers(self):
         if self.client is None or self._new_message_handler is not None:
             return
@@ -116,6 +157,7 @@ class TelegramService:
                 chat = await event.get_chat()
                 message = await self._message_to_dict(event.message)
                 message["chat_id"] = str(utils.get_peer_id(chat))
+                cache_store.merge_messages(message["chat_id"], [message])
             except Exception:
                 return
 
@@ -181,14 +223,40 @@ class TelegramService:
 
         return ""
 
-    async def _thumbnail_base64(self, message, timeout=3):
+    async def _thumbnail_bytes(self, message, timeout=3):
         if not (getattr(message, "photo", None) or getattr(message, "document", None)):
+            return b""
+
+        try:
+            # thumb=-1 请求最大可用缩略图，清晰度最佳；
+            # 速度由并发分批和原始消息缓存保证，不再靠缩小尺寸
+            data = await asyncio.wait_for(
+                self.client.download_media(message, file=bytes, thumb=-1),
+                timeout=timeout,
+            )
+        except (asyncio.TimeoutError, Exception):
+            return b""
+
+        return data or b""
+
+    async def _thumbnail_base64(self, message, timeout=3):
+        data = await self._thumbnail_bytes(message, timeout=timeout)
+        if not data:
+            return ""
+
+        return base64.b64encode(data).decode("ascii")
+
+    async def _avatar_base64(self, entity, dialog_id, fetch_remote=True):
+        cached = cache_store.load_avatar_base64(dialog_id)
+        if cached:
+            return cached
+        if not fetch_remote:
             return ""
 
         try:
             data = await asyncio.wait_for(
-                self.client.download_media(message, file=bytes, thumb=-1),
-                timeout=timeout,
+                self.client.download_profile_photo(entity, file=bytes),
+                timeout=4,
             )
         except (asyncio.TimeoutError, Exception):
             return ""
@@ -196,6 +264,7 @@ class TelegramService:
         if not data:
             return ""
 
+        cache_store.save_avatar(dialog_id, data)
         return base64.b64encode(data).decode("ascii")
 
     async def _message_to_dict(self, message, include_thumbnail=True):
@@ -272,16 +341,42 @@ class TelegramService:
     async def _list_dialogs(self, limit=80):
         await self._ensure_connected()
         dialogs = []
+        missing_avatars = []
         async for dialog in self.client.iter_dialogs(limit=limit):
             key = self._cache_entity(dialog.entity)
+            avatar = await self._avatar_base64(dialog.entity, key, fetch_remote=False)
             dialogs.append(
                 {
                     "id": key,
                     "title": dialog.name or "Untitled",
                     "unread_count": int(dialog.unread_count or 0),
                     "pinned": bool(dialog.pinned),
+                    "avatar_base64": avatar,
                 }
             )
+            if not avatar:
+                missing_avatars.append((len(dialogs) - 1, dialog.entity, key))
+
+        avatar_semaphore = asyncio.Semaphore(8)
+
+        async def fill_avatar(index, entity, key):
+            async with avatar_semaphore:
+                dialogs[index]["avatar_base64"] = await self._avatar_base64(
+                    entity,
+                    key,
+                    fetch_remote=True,
+                )
+
+        if missing_avatars:
+            await asyncio.gather(
+                *[
+                    fill_avatar(index, entity, key)
+                    for index, entity, key in missing_avatars
+                ],
+                return_exceptions=True,
+            )
+
+        cache_store.save_dialogs(dialogs)
         return dialogs
 
     def list_dialogs(self, limit=80, timeout=30):
@@ -290,6 +385,65 @@ class TelegramService:
     def list_dialogs_async(self, limit=80):
         return self.submit(self._list_dialogs(limit=limit))
 
+    def list_dialogs_cached(self):
+        return cache_store.load_dialogs()
+
+    def _hydrate_cached_thumbnails(self, chat_ref, messages):
+        for message in messages:
+            media_items = message.get("media_items") or []
+            if media_items:
+                for media in media_items:
+                    if media.get("thumbnail_base64"):
+                        continue
+                    media["thumbnail_base64"] = cache_store.load_thumbnail_base64(
+                        chat_ref,
+                        media.get("id"),
+                    )
+                continue
+
+            if message.get("thumbnail_base64"):
+                continue
+            if message.get("media_kind") in ("photo", "video"):
+                message["thumbnail_base64"] = cache_store.load_thumbnail_base64(
+                    chat_ref,
+                    message.get("id"),
+                )
+        return messages
+
+    async def _collect_raw_messages(
+        self,
+        chat_ref,
+        limit=60,
+        offset_id=0,
+        min_id=0,
+        reverse=False,
+    ):
+        last_error = None
+        for attempt in range(2):
+            try:
+                entity = await self.resolve_entity(chat_ref)
+                kwargs = {"limit": limit}
+                if offset_id:
+                    kwargs["offset_id"] = int(offset_id or 0)
+                if min_id:
+                    kwargs["min_id"] = int(min_id or 0)
+                    kwargs["reverse"] = bool(reverse)
+
+                raw_messages = []
+                async for message in self.client.iter_messages(entity, **kwargs):
+                    raw_messages.append(message)
+                return raw_messages
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0 and self._is_transient_network_error(exc):
+                    await self._reconnect_after_transient_error()
+                    continue
+                raise
+
+        if last_error:
+            raise last_error
+        return []
+
     async def _list_messages(
         self,
         chat_ref,
@@ -297,20 +451,54 @@ class TelegramService:
         include_thumbnails=True,
         offset_id=0,
     ):
-        entity = await self.resolve_entity(chat_ref)
-        messages = []
-        async for message in self.client.iter_messages(
-            entity,
+        raw_messages = await self._collect_raw_messages(
+            chat_ref,
             limit=limit,
             offset_id=int(offset_id or 0),
-        ):
-            messages.append(
-                await self._message_to_dict(
-                    message,
-                    include_thumbnail=include_thumbnails,
+        )
+
+        if not raw_messages:
+            return []
+
+        # 将原始 Telethon 消息对象缓存起来，后续缩略图下载可直接使用，
+        # 避免 _message_thumbnail_base64() 再次调用 get_messages()
+        chat_key = str(chat_ref)
+        for msg in raw_messages:
+            self._raw_message_cache[(chat_key, int(msg.id))] = msg
+
+        # 阶段二：并发下载所有缩略图
+        if include_thumbnails:
+            thumb_concurrency = 16
+
+            async def to_dict_with_thumb(msg):
+                return await self._message_to_dict(msg, include_thumbnail=True)
+
+            # 分批并发，避免同时建立过多连接
+            results = []
+            for i in range(0, len(raw_messages), thumb_concurrency):
+                batch = raw_messages[i:i + thumb_concurrency]
+                batch_results = await asyncio.gather(
+                    *[to_dict_with_thumb(m) for m in batch],
+                    return_exceptions=True,
                 )
-            )
-        return self._group_album_messages(list(reversed(messages)))
+                for msg, res in zip(batch, batch_results):
+                    if isinstance(res, Exception):
+                        results.append(
+                            await self._message_to_dict(msg, include_thumbnail=False)
+                        )
+                    else:
+                        results.append(res)
+            grouped = self._group_album_messages(list(reversed(results)))
+        else:
+            messages = [
+                await self._message_to_dict(m, include_thumbnail=False)
+                for m in raw_messages
+            ]
+            grouped = self._group_album_messages(list(reversed(messages)))
+
+        grouped = self._hydrate_cached_thumbnails(chat_ref, grouped)
+        cache_store.merge_messages(chat_ref, grouped)
+        return grouped
 
     def list_messages(
         self,
@@ -346,12 +534,76 @@ class TelegramService:
             ),
         )
 
+    async def _list_newer_messages(
+        self,
+        chat_ref,
+        min_id,
+        limit=60,
+        include_thumbnails=False,
+    ):
+        raw_messages = await self._collect_raw_messages(
+            chat_ref,
+            limit=limit,
+            min_id=int(min_id or 0),
+            reverse=True,
+        )
+
+        if not raw_messages:
+            return []
+
+        # 缓存原始消息对象供后续缩略图下载使用
+        chat_key = str(chat_ref)
+        for msg in raw_messages:
+            self._raw_message_cache[(chat_key, int(msg.id))] = msg
+
+        messages = [
+            await self._message_to_dict(m, include_thumbnail=include_thumbnails)
+            for m in raw_messages
+        ]
+        grouped = self._group_album_messages(messages)
+        grouped = self._hydrate_cached_thumbnails(chat_ref, grouped)
+        cache_store.merge_messages(chat_ref, grouped)
+        return grouped
+
+    def list_newer_messages_async(
+        self,
+        chat_ref,
+        min_id,
+        limit=60,
+        include_thumbnails=False,
+    ):
+        return self.submit(
+            self._list_newer_messages(
+                chat_ref=chat_ref,
+                min_id=min_id,
+                limit=limit,
+                include_thumbnails=include_thumbnails,
+            ),
+        )
+
+    def list_messages_cached(self, chat_ref, limit=60):
+        return cache_store.load_messages(chat_ref, limit=limit)
+
     async def _message_thumbnail_base64(self, chat_ref, message_id):
-        entity = await self.resolve_entity(chat_ref)
-        message = await self.client.get_messages(entity, ids=int(message_id))
-        if not message:
+        cached = cache_store.load_thumbnail_base64(chat_ref, message_id)
+        if cached:
+            return cached
+
+        # 优先使用 _list_messages() 缓存的原始消息对象，
+        # 避免再次调用 get_messages() API（每条消息可节省 ~200-500ms）
+        raw = self._raw_message_cache.get((str(chat_ref), int(message_id)))
+        if raw is None:
+            entity = await self.resolve_entity(chat_ref)
+            raw = await self.client.get_messages(entity, ids=int(message_id))
+            if not raw:
+                return ""
+
+        data = await self._thumbnail_bytes(raw, timeout=8)
+        if not data:
             return ""
-        return await self._thumbnail_base64(message, timeout=8)
+
+        cache_store.save_thumbnail(chat_ref, message_id, data)
+        return base64.b64encode(data).decode("ascii")
 
     def message_thumbnail_async(self, chat_ref, message_id):
         return self.submit(
@@ -361,11 +613,47 @@ class TelegramService:
             )
         )
 
+    def _clear_cached_dialog_unread(self, chat_ref):
+        dialogs = cache_store.load_dialogs()
+        changed = False
+        for dialog in dialogs:
+            if str(dialog.get("id")) != str(chat_ref):
+                continue
+            if int(dialog.get("unread_count") or 0) != 0:
+                dialog["unread_count"] = 0
+                changed = True
+            break
+        if changed:
+            cache_store.save_dialogs(dialogs)
+
+    async def _mark_chat_read(self, chat_ref):
+        self._clear_cached_dialog_unread(chat_ref)
+        entity = await self.resolve_entity(chat_ref)
+        await self.client.send_read_acknowledge(entity)
+        return True
+
+    def mark_chat_read_async(self, chat_ref):
+        return self.submit(self._mark_chat_read(chat_ref))
+
+    def purge_raw_message_cache(self, chat_ref=None):
+        """清理原始消息对象缓存，释放内存。
+        chat_ref=None 时清空全部缓存，否则只清指定聊天。"""
+        if chat_ref is None:
+            self._raw_message_cache.clear()
+            return
+        prefix = str(chat_ref)
+        keys_to_remove = [
+            k for k in self._raw_message_cache if k[0] == prefix
+        ]
+        for k in keys_to_remove:
+            del self._raw_message_cache[k]
+
     async def _send_message(self, chat_ref, text):
         entity = await self.resolve_entity(chat_ref)
         message = await self.client.send_message(entity, text)
         result = await self._message_to_dict(message)
         result["chat_id"] = str(chat_ref)
+        cache_store.merge_messages(chat_ref, [result])
         return result
 
     def send_message(self, chat_ref, text, timeout=30):
@@ -514,6 +802,33 @@ class TelegramService:
     def generate_qr(self):
         return self.call(self._generate_qr(), timeout=30)
 
+    def stop(self, timeout=15):
+        loop = self.loop
+        if loop is None:
+            self._started = False
+            return
+
+        if not loop.is_closed():
+            if loop.is_running():
+                try:
+                    self.submit(self._stop()).result(timeout=timeout)
+                except Exception:
+                    pass
+                try:
+                    loop.call_soon_threadsafe(loop.stop)
+                except RuntimeError:
+                    pass
+            else:
+                try:
+                    loop.run_until_complete(self._stop())
+                except RuntimeError:
+                    pass
+
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=timeout)
+
+        self._started = False
+
     async def _stop(self):
         try:
             if self._qr_wait_task and not self._qr_wait_task.done():
@@ -527,20 +842,13 @@ class TelegramService:
 
             if self.client and self.client.is_connected():
                 await self.client.disconnect()
-        finally:
-            self.loop.stop()
 
-    def stop(self):
-        if not self._started or not self.loop:
-            return
-
-        fut = self.submit(self._stop())
-        try:
-            fut.result(timeout=10)
+            # 取消所有剩余任务（缩略图下载等），防止 GeneratorExit 警告
+            current = asyncio.current_task()
+            remaining = [t for t in asyncio.all_tasks(self.loop) if t is not current]
+            for task in remaining:
+                task.cancel()
+            if remaining:
+                await asyncio.gather(*remaining, return_exceptions=True)
         except Exception:
             pass
-
-        if self.thread:
-            self.thread.join(timeout=10)
-
-        self._started = False

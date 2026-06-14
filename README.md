@@ -18,6 +18,7 @@
 - 下载进度、速度和错误信息显示
 - SOCKS5 / HTTP 代理配置
 - 代理连通 Telegram 测试
+- 英文 / 简体中文界面切换
 - PyInstaller 打包 exe
 
 ## 环境
@@ -37,7 +38,7 @@ Telegram API 信息仍在 `config.py` 中：
 - `API_ID`
 - `API_HASH`
 
-代理、下载目录、任务并发数、分块并发数可以在应用内 `Settings` 页面设置。配置会保存到：
+语言、代理、下载目录、任务并发数、分块并发数可以在应用内 `Settings` 页面设置。配置会保存到：
 
 ```text
 data/settings.json

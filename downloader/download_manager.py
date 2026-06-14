@@ -95,6 +95,20 @@ class DownloadManager:
             return
 
         with self.lock:
+            if task.status == "finished":
+                return
+            if (
+                task.total_size > 0
+                and task.file_path
+                and Path(task.file_path).exists()
+                and Path(task.file_path).stat().st_size >= task.total_size
+            ):
+                clear_meta(task.file_path)
+                task.update_progress(task.total_size, task.total_size, 0.0)
+                task.set_status("finished")
+                db.upsert_task(task)
+                return
+
             task.pause_event.clear()
             task.cancel_event.clear()
 
@@ -210,6 +224,13 @@ class DownloadManager:
             task.file_path = file_path
 
             path_obj = Path(file_path)
+            if task.total_size and path_obj.exists() and path_obj.stat().st_size >= task.total_size:
+                clear_meta(file_path)
+                task.update_progress(task.total_size, task.total_size, 0.0)
+                task.set_status("finished")
+                db.upsert_task(task)
+                return
+
             if not path_obj.exists():
                 with open(path_obj, "wb") as f:
                     f.truncate(task.total_size)
@@ -316,7 +337,7 @@ class DownloadManager:
             else:
                 task.set_status("paused")
 
-                db.upsert_task(task)
+            db.upsert_task(task)
 
         except Exception as exc:
             task.set_status("failed")

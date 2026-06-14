@@ -15,6 +15,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
+        ("assets/app.ico", "assets"),
         ("data/settings.json", "data"),
     ],
     hiddenimports=hiddenimports,
@@ -46,6 +47,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon="assets/app.ico",
 )
 
 coll = COLLECT(

@@ -1,8 +1,9 @@
 import sys
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import QApplication, QDialog
 
-from config import APP_NAME
+from config import APP_ICON_FILE, APP_NAME
 from core.settings_manager import settings_manager
 from downloader.download_manager import DownloadManager
 from telegram.service import TelegramService
@@ -13,6 +14,9 @@ from ui.main_window import MainWindow
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    app_icon = QIcon(str(APP_ICON_FILE))
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
 
     telegram_service = TelegramService(settings_manager)
     telegram_service.start()
@@ -21,12 +25,14 @@ def main() -> int:
 
     try:
         if not telegram_service.is_authorized(timeout=20):
-            dlg = LoginDialog(telegram_service)
-            if dlg.exec() != dlg.Accepted:
+            dlg = LoginDialog(telegram_service, settings_manager)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
                 telegram_service.stop()
                 return 0
 
         window = MainWindow(telegram_service, download_manager, settings_manager)
+        if not app_icon.isNull():
+            window.setWindowIcon(app_icon)
         window.show()
         exit_code = app.exec()
     finally:
